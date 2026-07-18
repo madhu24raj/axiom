@@ -1,7 +1,7 @@
 """
 main.py
 -------
-FastAPI entrypoint for The VC Brain.
+FastAPI entrypoint for Axiom OS (formerly "The VC Brain").
 
 Responsibilities:
 - Own the global Live / Demo mode toggle (single source of truth, exposed
@@ -12,6 +12,10 @@ Responsibilities:
 - Expose the pipeline: thesis filter -> 3-axis screen -> validator ->
   investment memo, for both Mode A (historical simulation replay) and
   Mode B (live/cached hackathon ingestion).
+- Expose the Sourcing Network Graph (real graph-theoretic centrality /
+  fragmentation math, via network_analysis.py) and a Command KPI /
+  Pipeline Funnel overview (aggregated live from the current roster,
+  never hand-typed totals).
 
 Run with:
     uvicorn main:app --reload --port 8000
@@ -35,9 +39,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import mock_data
-from scoring import FounderProfile, SignalMetric, MomentumTracker
+from scoring import FounderProfile, SignalMetric, MomentumTracker, FounderScoreEngine
 from agents import (
     AgentTools, ThesisEngine, ThesisCriteria, DealOrchestrator, DealEvaluation,
+)
+from network_analysis import (
+    SourcingNetworkEngine, NetworkNodeIn, NetworkEdgeIn, SourcingNetworkResult,
 )
 
 logging.basicConfig(
@@ -46,7 +53,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("vc_brain.main")
 
-app = FastAPI(title="The VC Brain", version="0.1.0")
+app = FastAPI(title="Axiom OS", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -107,13 +114,16 @@ class LiveTavilyClient:
             )
             resp.raise_for_status()
             data = resp.json()
+        results = data.get("results", [])
         # Normalize Tavily's raw shape into the schema our agents expect.
+        top_content = (results[0].get("content") if results else None) or None
         return {
             "source_label": "tavily_live",
-            "urls": [r.get("url") for r in data.get("results", [])],
-            "competitor_count": len(data.get("results", [])),
+            "urls": [r.get("url") for r in results],
+            "competitor_count": len(results),
             "saturation_index": None,   # requires downstream LLM synthesis of raw results
             "extracted_value": None,    # claim-specific extraction happens in ValidatorAgent's caller
+            "evidence_excerpt": (top_content[:220] + "…") if top_content and len(top_content) > 220 else top_content,
             "verified": None,
         }
 
@@ -132,6 +142,7 @@ class CachedTavilyClient:
                     "competitor_count": 7,
                     "saturation_index": 0.22,
                     "extracted_value": v["extracted_value"],
+                    "evidence_excerpt": v.get("results_summary"),
                     "verified": v["verified"],
                 }
         # Generic fallback demo response
@@ -141,6 +152,7 @@ class CachedTavilyClient:
             "competitor_count": 5,
             "saturation_index": 0.30,
             "extracted_value": None,
+            "evidence_excerpt": "[DEMO] No cached verification snippet matched this query.",
             "verified": None,
         }
 
@@ -268,7 +280,7 @@ async def evaluate_opportunity(req: EvaluateOpportunityRequest):
 
 
 # ---------------------------------------------------------------------------
-# Mode A: Reverse Sourcing historical simulation replay
+# Mode A: Reverse Sourcing historical simulation
 # ---------------------------------------------------------------------------
 @app.get("/api/simulation/historical")
 async def get_historical_simulation():
@@ -299,6 +311,133 @@ async def get_hackathon_profiles():
         status_code=501,
         detail="Live profile ingestion not configured. Set source webhook URLs or use Demo mode.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Sourcing Network Graph -- real centrality / fragmentation math computed by
+# network_analysis.SourcingNetworkEngine on top of a topology. In Demo mode
+# the topology is the labeled fixture in mock_data.py; in Live mode this
+# would run the identical engine over an ingested collaboration graph (not
+# yet wired up, so it fails loudly rather than silently mock-serving).
+# ---------------------------------------------------------------------------
+_network_engine = SourcingNetworkEngine()
+
+
+@app.get("/api/network/sourcing", response_model=SourcingNetworkResult)
+async def get_sourcing_network():
+    if not mode_state.demo_mode:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Live network ingestion not configured. The centrality/DMS "
+                "engine (network_analysis.py) is live-mode-ready, but no "
+                "collaboration-graph ingestion adapter is wired up yet. "
+                "Switch to Demo mode to see the engine run on fixture data."
+            ),
+        )
+    raw_nodes = [NetworkNodeIn(**n) for n in mock_data.get_mock_payload("sourcing_network_nodes")]
+    raw_edges = [NetworkEdgeIn(**e) for e in mock_data.get_mock_payload("sourcing_network_edges")]
+    return _network_engine.run(raw_nodes, raw_edges)
+
+
+# ---------------------------------------------------------------------------
+# Command KPIs + Pipeline Funnel -- aggregated from the current hackathon
+# roster (Founder Score computed live via FounderScoreEngine, thesis-fit
+# computed live via ThesisEngine) rather than hand-typed summary numbers,
+# so the KPI cards can never drift out of sync with the underlying rows.
+# ---------------------------------------------------------------------------
+CHECK_SIZE_USD = 100_000
+HIGH_POTENTIAL_THRESHOLD = 55.0
+
+
+def _profile_to_signals(raw_signals: Dict[str, Any]) -> List[SignalMetric]:
+    """Best-effort mapping of a hackathon telemetry blob into SignalMetric
+    rows the FounderScoreEngine already knows how to decay-weight. This is
+    the same signal schema /api/evaluate consumes -- no parallel math path."""
+    now = datetime.utcnow()
+    commits = raw_signals.get("commits_7d", 0)
+    stars = raw_signals.get("stars_7d", 0)
+    tier = raw_signals.get("hackathon_award_tier", "none")
+    tier_score = {"finalist": 0.95, "honorable mention": 0.7, "none": 0.35}.get(tier, 0.35)
+
+    return [
+        SignalMetric(
+            source="github",
+            timestamp=now,
+            normalized_score=min(1.0, commits / 60.0),
+            confidence=0.7,
+            data_points={"commits_7d": commits, "stars_7d": stars},
+        ),
+        SignalMetric(
+            source="hackathon",
+            timestamp=now,
+            normalized_score=tier_score,
+            confidence=0.8,
+            data_points={"hackathon_award_tier": tier},
+        ),
+    ]
+
+
+class PipelineOverviewResponse(BaseModel):
+    kpis: Dict[str, Any]
+    funnel: List[Dict[str, Any]]
+    label: str = "[Aggregated live from the current hackathon roster — not hand-typed totals]"
+
+
+@app.get("/api/pipeline/overview", response_model=PipelineOverviewResponse)
+async def get_pipeline_overview():
+    if not mode_state.demo_mode:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Live pipeline aggregation requires a persistent evaluation "
+                "store (not yet wired up). Switch to Demo mode to see KPIs "
+                "aggregated from the fixture roster."
+            ),
+        )
+
+    score_engine = FounderScoreEngine()
+    thesis = ThesisEngine(ThesisCriteria())
+    profiles = mock_data.get_mock_payload("live_hackathon_profiles")
+
+    scored: List[Dict[str, Any]] = []
+    for p in profiles:
+        signals = _profile_to_signals(p.get("raw_signals", {}))
+        f_s = score_engine.calculate_score(signals)
+        thesis_result = thesis.passes({"sector": p.get("sector", "unknown"), "founder_score": f_s})
+        scored.append({
+            **p,
+            "founder_score": f_s,
+            "thesis_pass": thesis_result.detail.startswith("PASS"),
+        })
+
+    total = len(scored)
+    high_potential = sum(1 for s in scored if s["founder_score"] >= HIGH_POTENTIAL_THRESHOLD)
+    avg_founder_score = round(sum(s["founder_score"] for s in scored) / total, 2) if total else 0.0
+    approved = [s for s in scored if s.get("pipeline_stage") == "approved"]
+    capital_deployed = len(approved) * CHECK_SIZE_USD
+
+    kpis = {
+        "total_opportunities": total,
+        "high_potential_count": high_potential,
+        "avg_founder_score": avg_founder_score,
+        "capital_deployed_usd": capital_deployed,
+        "check_size_usd": CHECK_SIZE_USD,
+        "thesis_pass_rate_pct": round(100 * sum(1 for s in scored if s["thesis_pass"]) / total, 1) if total else 0.0,
+    }
+
+    stage_order = mock_data.PIPELINE_STAGE_ORDER
+    stage_index = {s: i for i, s in enumerate(stage_order)}
+    funnel = []
+    for i, stage in enumerate(stage_order):
+        # Cumulative: count of opportunities that have reached AT LEAST this stage.
+        count = sum(
+            1 for s in scored
+            if stage_index.get(s.get("pipeline_stage", "sourced"), 0) >= i
+        )
+        funnel.append({"stage": stage, "count": count})
+
+    return PipelineOverviewResponse(kpis=kpis, funnel=funnel)
 
 
 @app.get("/api/healthz")

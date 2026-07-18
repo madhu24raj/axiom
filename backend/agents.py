@@ -1,7 +1,7 @@
 """
 agents.py
 ---------
-Asynchronous agent mesh for The VC Brain.
+Asynchronous agent mesh for The VC Brain / Axiom OS.
 
     Thesis Engine Filter
             |
@@ -98,6 +98,12 @@ class AxisResult:
     confidence: float
     reasoning_trace: List[ReasoningStep]
     raw_refs: List[str]
+    # Structured, axis-specific math the Overseer panel can render directly
+    # (e.g. the Founder axis's per-signal F_S breakdown). Left as a plain
+    # dict so each axis can carry its own shape without a proliferation of
+    # near-identical dataclasses; always populated from a real computation,
+    # never fabricated for display.
+    metadata: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -154,10 +160,14 @@ class FounderAxisAgent:
         trace: List[ReasoningStep] = []
         refs: List[str] = list(profile.public_footprints.values()) if profile.public_footprints else []
 
-        f_s = self.score_engine.calculate_score(profile.historical_signals)
+        breakdown = self.score_engine.calculate_score_breakdown(profile.historical_signals)
+        f_s = breakdown.founder_score
         trace.append(ReasoningStep(
             step="founder_score_calc",
-            detail=f"F_S computed from {len(profile.historical_signals)} decayed signals = {f_s}",
+            detail=(
+                f"F_S computed from {len(profile.historical_signals)} decayed signals = {f_s} "
+                f"(lambda={breakdown.lambda_decay})"
+            ),
         ))
 
         # Skill matrix / grit -- delegated to the LLM for qualitative read,
@@ -182,6 +192,7 @@ class FounderAxisAgent:
         return AxisResult(
             axis="founder", score=f_s, confidence=round(confidence, 2),
             reasoning_trace=trace, raw_refs=[str(r) for r in refs],
+            metadata={"founder_score_breakdown": breakdown.model_dump()},
         )
 
 
@@ -229,6 +240,7 @@ class MarketAxisAgent:
         return AxisResult(
             axis="market", score=score, confidence=0.6 if score is not None else 0.2,
             reasoning_trace=trace, raw_refs=refs,
+            metadata={"saturation_index": saturation, "macro_stance": macro.value, "competitor_count": competitor_count},
         )
 
 
@@ -262,6 +274,7 @@ class IdeaMarketAxisAgent:
             confidence=0.55,
             reasoning_trace=trace,
             raw_refs=[],
+            metadata={"rationale": llm_result.get("rationale")},
         )
 
 
@@ -294,6 +307,7 @@ class ValidatorAgent:
             claimed_value=claimed_value,
             extracted_value=extracted_value,
             source_url=(search_result.get("urls") or [None])[0],
+            evidence_excerpt=search_result.get("evidence_excerpt"),
             verified=verified_flag,
         )]
         result = self.trust_engine.score_claim(claim_text, evidence)

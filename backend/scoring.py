@@ -1,9 +1,10 @@
 """
 scoring.py
 ----------
-Core quantitative engines for The VC Brain:
+Core quantitative engines for The VC Brain / Axiom OS:
 
-1. FounderScoreEngine   -> exponentially-decayed, multi-source Founder Score (F_S)
+1. FounderScoreEngine   -> exponentially-decayed, multi-source Founder Score (F_S),
+                            plus a per-signal breakdown for the Overseer panel
 2. TrustScoreEngine     -> Bayesian per-claim trust scoring against Tavily
                             verification evidence
 3. MomentumTracker      -> helper for turning score_history into a directional
@@ -64,6 +65,27 @@ class MomentumDirection(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# Per-signal breakdown -- powers the Overseer's "show your work" math panel.
+# Every field here is read directly off the same computation the final F_S
+# number comes from; nothing is recomputed or approximated for display.
+# ---------------------------------------------------------------------------
+class SignalContribution(BaseModel):
+    source: SignalSource
+    age_days: int
+    normalized_score: float
+    source_weight: float
+    decay_factor: float
+    contribution: float          # source_weight * normalized_score * decay_factor
+    contribution_pct_of_total: float  # what % of F_S this single signal explains
+
+
+class FounderScoreBreakdown(BaseModel):
+    founder_score: float
+    lambda_decay: float
+    signals: List[SignalContribution]
+
+
+# ---------------------------------------------------------------------------
 # 1. Founder Score Engine
 #
 #   F_S = sum_i  w_i * ( S_i * e^(-lambda * t_i) )
@@ -86,6 +108,12 @@ class FounderScoreEngine:
             SignalSource.INBOUND_DECK: 0.20,
         }
 
+    @staticmethod
+    def _age_days(sig_timestamp: datetime, now: datetime) -> int:
+        sig_time = sig_timestamp if sig_timestamp.tzinfo else sig_timestamp.replace(tzinfo=timezone.utc)
+        safe_now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        return max(0, (safe_now - sig_time).days)
+
     def calculate_score(self, signals: List[SignalMetric]) -> float:
         """Returns a 0-100 Founder Score."""
         if not signals:
@@ -95,13 +123,7 @@ class FounderScoreEngine:
         now = datetime.utcnow()
 
         for sig in signals:
-            # Force timezone awareness to prevent mathematical drift
-            sig_time = sig.timestamp if sig.timestamp.tzinfo else sig.timestamp.replace(tzinfo=timezone.utc)
-            safe_now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
-            
-            # Now safely calculate the decay
-            t_days = max(0, (safe_now - sig_time).days)
-            #t_days = max(0, (now - sig.timestamp).days)
+            t_days = self._age_days(sig.timestamp, now)
             decay = math.exp(-self.lambda_decay * t_days)
             weight = self.weights.get(sig.source, 0.10)
             contribution = weight * sig.normalized_score * decay
@@ -114,6 +136,53 @@ class FounderScoreEngine:
         score = min(100.0, round(total * 100, 2))
         logger.info("Computed Founder Score = %.2f from %d signals", score, len(signals))
         return score
+
+    def calculate_score_breakdown(self, signals: List[SignalMetric]) -> FounderScoreBreakdown:
+        """Same math as calculate_score, but returns the full per-signal
+        ledger so the Overseer panel can render exactly how F_S was built,
+        signal by signal, instead of a single opaque number."""
+        if not signals:
+            return FounderScoreBreakdown(
+                founder_score=0.0, lambda_decay=self.lambda_decay, signals=[]
+            )
+
+        now = datetime.utcnow()
+        raw_contributions: List[Dict[str, Any]] = []
+        total = 0.0
+
+        for sig in signals:
+            t_days = self._age_days(sig.timestamp, now)
+            decay = math.exp(-self.lambda_decay * t_days)
+            weight = self.weights.get(sig.source, 0.10)
+            contribution = weight * sig.normalized_score * decay
+            total += contribution
+            raw_contributions.append({
+                "source": sig.source,
+                "age_days": t_days,
+                "normalized_score": sig.normalized_score,
+                "source_weight": weight,
+                "decay_factor": round(decay, 4),
+                "contribution": contribution,
+            })
+
+        score = min(100.0, round(total * 100, 2))
+        signal_rows = [
+            SignalContribution(
+                source=row["source"],
+                age_days=row["age_days"],
+                normalized_score=row["normalized_score"],
+                source_weight=row["source_weight"],
+                decay_factor=row["decay_factor"],
+                contribution=round(row["contribution"] * 100, 3),
+                contribution_pct_of_total=(
+                    round((row["contribution"] / total) * 100, 2) if total > 0 else 0.0
+                ),
+            )
+            for row in raw_contributions
+        ]
+        return FounderScoreBreakdown(
+            founder_score=score, lambda_decay=self.lambda_decay, signals=signal_rows
+        )
 
     def score_and_update(self, profile: FounderProfile) -> FounderProfile:
         """Recompute F_S, append to score_history, and return the mutated profile."""
@@ -143,6 +212,7 @@ class ClaimVerification(BaseModel):
     claimed_value: Optional[float] = None
     extracted_value: Optional[float] = None
     source_url: Optional[str] = None
+    evidence_excerpt: Optional[str] = None  # short cached/live snippet the Overseer can read
     verified: bool
 
 
@@ -151,6 +221,9 @@ class TrustScoreResult(BaseModel):
     trust_score: float = Field(..., ge=0.0, le=1.0)
     discrepancy_pct: Optional[float] = None
     flagged: bool
+    prior_mean: float
+    posterior_successes: float
+    posterior_failures: float
     evidence: List[ClaimVerification]
 
 
@@ -170,15 +243,19 @@ class TrustScoreEngine:
     def score_claim(
         self, claim_text: str, evidence: List[ClaimVerification]
     ) -> TrustScoreResult:
+        prior_mean = self.alpha_prior / (self.alpha_prior + self.beta_prior)
+
         if not evidence:
             # No verification attempted yet -> return prior mean, unflagged
             # but implicitly low-confidence (n=0).
-            prior_mean = self.alpha_prior / (self.alpha_prior + self.beta_prior)
             return TrustScoreResult(
                 claim_text=claim_text,
                 trust_score=round(prior_mean, 3),
                 discrepancy_pct=None,
                 flagged=False,
+                prior_mean=round(prior_mean, 3),
+                posterior_successes=0.0,
+                posterior_failures=0.0,
                 evidence=[],
             )
 
@@ -210,6 +287,9 @@ class TrustScoreEngine:
             trust_score=round(posterior_mean, 3),
             discrepancy_pct=max_discrepancy or None,
             flagged=flagged,
+            prior_mean=round(prior_mean, 3),
+            posterior_successes=successes,
+            posterior_failures=failures,
             evidence=evidence,
         )
         logger.info(
