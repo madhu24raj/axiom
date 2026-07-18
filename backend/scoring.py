@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import List, Dict, Any, Optional
 
@@ -95,7 +95,13 @@ class FounderScoreEngine:
         now = datetime.utcnow()
 
         for sig in signals:
-            t_days = max(0, (now - sig.timestamp).days)
+            # Force timezone awareness to prevent mathematical drift
+            sig_time = sig.timestamp if sig.timestamp.tzinfo else sig.timestamp.replace(tzinfo=timezone.utc)
+            safe_now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+            
+            # Now safely calculate the decay
+            t_days = max(0, (safe_now - sig_time).days)
+            #t_days = max(0, (now - sig.timestamp).days)
             decay = math.exp(-self.lambda_decay * t_days)
             weight = self.weights.get(sig.source, 0.10)
             contribution = weight * sig.normalized_score * decay
