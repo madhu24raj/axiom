@@ -51,6 +51,7 @@ function radiusFor(node: NetworkNodeOut): number {
 
 function edgeDash(edgeType: string): string | undefined {
   if (edgeType === "mentorship") return "2 3";
+  if (edgeType === "shared_evidence") return "5 4";
   return undefined;
 }
 

@@ -8,7 +8,7 @@
  * backend returns score: null -- this file never fills that gap with a guess.
  */
 
-import type { AxisResult, DealRow } from "../lib/types";
+import type { AxisResult, DealRow } from "../../lib/types";
 import ProvenanceChip from "./ProvenanceChip";
 import { FileText } from "lucide-react";
 
@@ -27,15 +27,33 @@ function TrendChip({ trend }: { trend?: "improving" | "declining" | "stable" }) 
   );
 }
 
+function thesisReject(row: { thesis_check?: { detail: string } | null }): string | null {
+  const d = row.thesis_check?.detail;
+  return d && d.startsWith("REJECT") ? d : null;
+}
+
 function AxisScore({
   result,
   label,
   trend,
+  rejectReason,
 }: {
   result: AxisResult | null;
   label: string;
   trend?: "improving" | "declining" | "stable";
+  rejectReason?: string | null;
 }) {
+  if (rejectReason) {
+    // Axes are null BY DESIGN for thesis-rejected deals — render the gate
+    // verdict, not a data-gap placeholder, so "filtered out" never reads as
+    // "broken ingestion".
+    return (
+      <div className="flex flex-col gap-0.5" title={rejectReason}>
+        <span className="font-mono text-[10px] uppercase tracking-wider text-dim">{label}</span>
+        <span className="font-mono text-sm text-bear">✕ thesis</span>
+      </div>
+    );
+  }
   if (!result || result.score === null) {
     return (
       <div className="flex flex-col gap-0.5">
@@ -149,6 +167,14 @@ export default function DealPipelineTable({
                     <div className="flex items-center gap-2">
                       <p className="font-sans text-sm text-primary">{row.founder_name}</p>
                       <ProvenanceChip provenance={row.data_provenance} confidence={row.data_confidence} />
+                      {thesisReject(row) && (
+                        <span
+                          className="rounded border border-bear/40 bg-panel-inset px-1 py-0.5 font-mono text-[9px] uppercase tracking-wider text-bear"
+                          title={thesisReject(row) ?? undefined}
+                        >
+                          thesis reject
+                        </span>
+                      )}
                       {(row.applications_on_file ?? 1) > 1 && (
                         <span
                           className="rounded border border-hair bg-panel-inset px-1 py-0.5 font-mono text-[9px] text-dim"
@@ -166,13 +192,13 @@ export default function DealPipelineTable({
                     </span>
                   </td>
                   <td className="px-4 py-3">
-                    <AxisScore result={row.founder} label="F_S" trend={row.axis_trends?.founder} />
+                    <AxisScore result={row.founder} label="F_S" trend={row.axis_trends?.founder} rejectReason={thesisReject(row)} />
                   </td>
                   <td className="px-4 py-3">
-                    <AxisScore result={row.market} label="MKT" trend={row.axis_trends?.market} />
+                    <AxisScore result={row.market} label="MKT" trend={row.axis_trends?.market} rejectReason={thesisReject(row)} />
                   </td>
                   <td className="px-4 py-3">
-                    <AxisScore result={row.idea_vs_market} label="PIVOT" trend={row.axis_trends?.idea_vs_market} />
+                    <AxisScore result={row.idea_vs_market} label="PIVOT" trend={row.axis_trends?.idea_vs_market} rejectReason={thesisReject(row)} />
                   </td>
                   <td className="px-4 py-3">
                     <MomentumBadge momentum={row.momentum} />

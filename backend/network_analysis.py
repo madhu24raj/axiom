@@ -281,3 +281,282 @@ class SourcingNetworkEngine:
             structural_risks=risks,
             stats=stats,
         )
+
+
+# ===========================================================================
+# LIVE GRAPH GROWTH LAYER
+# ---------------------------------------------------------------------------
+# Two additions that make Live mode's graph real instead of empty:
+#
+#   1. infer_edges_for_new_node(...) -- deterministic, evidence-based edge
+#      inference for nodes added by session searches. Fixes the bug where
+#      live_state.graph_edges was declared but never written: nodes were
+#      registered, edges never were, so eigenvector/betweenness/DMS were
+#      computed over an edgeless graph (all zeros).
+#
+#   2. GitHubGraphSeeder -- seeds Live mode with REAL public GitHub data:
+#      configured org/user handles -> their top public repos (by stars) ->
+#      those repos' top public contributors. Every node and edge is a direct
+#      readout of the GitHub REST API (with source URLs + fetched_at stamped
+#      into node.meta), never invented. If GitHub is unreachable (rate limit,
+#      no network), the seeder raises SeederUnavailable and main.py falls
+#      back to the clearly-labeled demo topology -- honest fallback, never a
+#      silently fabricated "live" graph.
+# ===========================================================================
+
+import math
+import os
+import re as _re
+from datetime import datetime, timezone
+
+import httpx
+
+
+# ---------------------------------------------------------------------------
+# 1) Session edge inference
+# ---------------------------------------------------------------------------
+def _edge_key(e: NetworkEdgeIn) -> Tuple[str, str]:
+    return (min(e.source, e.target), max(e.source, e.target))
+
+
+def _domains_from_urls(urls: List[str]) -> set:
+    out = set()
+    for u in urls or []:
+        m = _re.match(r"https?://(?:www\.)?([^/]+)", str(u))
+        if m:
+            out.add(m.group(1).lower())
+    return out
+
+
+def infer_edges_for_new_node(
+    new_node: NetworkNodeIn,
+    existing_nodes: List[NetworkNodeIn],
+    existing_edges: List[NetworkEdgeIn],
+) -> List[NetworkEdgeIn]:
+    """Deterministic edges between a freshly-searched node and the graph.
+
+    Every edge corresponds to a stated, checkable relationship in node meta --
+    no similarity model, no randomness, no invented links:
+
+      * shared evidence domain  (both nodes cite a source on the same domain)
+        -> weight 2.0, edge_type "shared_evidence"
+      * same sector             (identical, known sector strings)
+        -> weight 1.0, edge_type "collaboration"
+      * github handle linkage   (searched node's github login appears among a
+        seeded repo's contributors, or matches a seeded developer node)
+        -> weight 3.0, edge_type "contribution"
+
+    If nothing matches, the node legitimately stays an isolate -- the engine
+    handles disconnected graphs, and an honest isolate beats a fake edge.
+    """
+    seen = {_edge_key(e) for e in existing_edges}
+    out: List[NetworkEdgeIn] = []
+
+    def _add(target_id: str, weight: float, edge_type: str):
+        e = NetworkEdgeIn(source=new_node.id, target=target_id, weight=weight, edge_type=edge_type)
+        k = _edge_key(e)
+        if k not in seen and new_node.id != target_id:
+            seen.add(k)
+            out.append(e)
+
+    new_domains = _domains_from_urls(new_node.meta.get("source_urls", []))
+    new_sector = (new_node.meta.get("sector") or "").strip().lower()
+    new_login = (new_node.meta.get("github_login") or "").strip().lower()
+
+    for other in existing_nodes:
+        if other.id == new_node.id:
+            continue
+        o_meta = other.meta or {}
+
+        if new_login:
+            if (o_meta.get("github_login") or "").strip().lower() == new_login:
+                _add(other.id, 3.0, "contribution")
+                continue
+            contributors = {str(c).lower() for c in o_meta.get("contributor_logins", [])}
+            if new_login in contributors:
+                _add(other.id, 3.0, "contribution")
+                continue
+
+        shared = new_domains & _domains_from_urls(o_meta.get("source_urls", []))
+        if shared:
+            _add(other.id, 2.0, "shared_evidence")
+            continue
+
+        o_sector = (o_meta.get("sector") or "").strip().lower()
+        if new_sector and o_sector and new_sector == o_sector and new_sector != "unknown":
+            _add(other.id, 1.0, "collaboration")
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 2) GitHub public-API seeder
+# ---------------------------------------------------------------------------
+class SeederUnavailable(RuntimeError):
+    """GitHub could not be reached / rate-limited. Callers must fall back to
+    an honest labeled alternative, never to fabricated 'live' data."""
+
+
+DEFAULT_SEED_HANDLES = ["getcursor", "anysphere"]  # Cursor's public GitHub orgs
+
+
+class GitHubGraphSeeder:
+    """Builds a (nodes, edges) topology from the GitHub REST API.
+
+    Request budget per seed run (defaults): 1/handle profile + 1/org repo
+    list + 1/repo contributor list ~= 8 requests total -- comfortably inside
+    even the unauthenticated 60 req/hr limit. Set GITHUB_TOKEN for 5000/hr.
+    """
+
+    API = "https://api.github.com"
+
+    def __init__(
+        self,
+        handles: Optional[List[str]] = None,
+        top_repos_per_org: int = 2,
+        top_contributors_per_repo: int = 6,
+    ):
+        env_handles = os.environ.get("SEED_GITHUB_HANDLES", "")
+        self.handles = handles or (
+            [h.strip() for h in env_handles.split(",") if h.strip()] or DEFAULT_SEED_HANDLES
+        )
+        self.top_repos_per_org = top_repos_per_org
+        self.top_contributors_per_repo = top_contributors_per_repo
+        token = os.environ.get("GITHUB_TOKEN")
+        self.headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "vc-brain-hackathon-prototype",
+        }
+        if token:
+            self.headers["Authorization"] = f"Bearer {token}"
+
+    async def _get(self, client: httpx.AsyncClient, path: str) -> Any:
+        resp = await client.get(f"{self.API}{path}", headers=self.headers)
+        if resp.status_code in (403, 429):
+            raise SeederUnavailable(
+                f"GitHub rate limit hit on {path} "
+                "(set GITHUB_TOKEN to raise the limit to 5000 req/hr)"
+            )
+        if resp.status_code == 404:
+            return None  # handle/repo doesn't exist -- skip, don't fail the run
+        resp.raise_for_status()
+        return resp.json()
+
+    async def seed(self) -> Tuple[List[NetworkNodeIn], List[NetworkEdgeIn], Dict[str, Any]]:
+        """Returns (nodes, edges, seed_meta). Raises SeederUnavailable if the
+        API is unreachable. Skips (with a log line) any configured handle
+        that doesn't exist -- it will never invent a profile for it."""
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        nodes: Dict[str, NetworkNodeIn] = {}
+        edges: List[NetworkEdgeIn] = []
+        edge_seen: set = set()
+        skipped: List[str] = []
+
+        def _add_edge(src: str, dst: str, weight: float, edge_type: str):
+            e = NetworkEdgeIn(source=src, target=dst, weight=weight, edge_type=edge_type)
+            k = _edge_key(e)
+            if k not in edge_seen and src != dst:
+                edge_seen.add(k)
+                edges.append(e)
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                for handle in self.handles:
+                    profile = await self._get(client, f"/users/{handle}")
+                    if profile is None:
+                        skipped.append(handle)
+                        logger.warning("Seed handle %r not found on GitHub -- skipped.", handle)
+                        continue
+
+                    is_org = profile.get("type") == "Organization"
+                    org_id = f"gh-{profile['login'].lower()}"
+                    nodes[org_id] = NetworkNodeIn(
+                        id=org_id,
+                        label=profile.get("name") or profile["login"],
+                        node_type="hackathon" if is_org else "developer",
+                        sub_label="GitHub org" if is_org else "GitHub user",
+                        meta={
+                            "github_login": profile["login"],
+                            "followers": profile.get("followers"),
+                            "public_repos": profile.get("public_repos"),
+                            "source_urls": [profile.get("html_url")],
+                            "data_provenance": "github_public_api",
+                            "fetched_at": fetched_at,
+                        },
+                    )
+
+                    repos_path = f"/orgs/{handle}/repos?per_page=30" if is_org \
+                        else f"/users/{handle}/repos?per_page=30"
+                    repos = await self._get(client, repos_path) or []
+                    if not repos and is_org:
+                        # Some orgs list repos only via the /users endpoint
+                        repos = await self._get(client, f"/users/{handle}/repos?per_page=30") or []
+                    repos = sorted(repos, key=lambda r: r.get("stargazers_count", 0), reverse=True)
+                    for repo in repos[: self.top_repos_per_org]:
+                        repo_id = f"gh-repo-{repo['full_name'].lower().replace('/', '-')}"
+                        contributors = await self._get(
+                            client,
+                            f"/repos/{repo['full_name']}/contributors"
+                            f"?per_page={self.top_contributors_per_repo}",
+                        ) or []
+                        contributor_logins = [
+                            c["login"] for c in contributors if c.get("type") == "User"
+                        ]
+                        nodes[repo_id] = NetworkNodeIn(
+                            id=repo_id,
+                            label=repo["name"],
+                            node_type="repo",
+                            sub_label=f"★ {repo.get('stargazers_count', 0):,}",
+                            meta={
+                                "full_name": repo["full_name"],
+                                "stars": repo.get("stargazers_count"),
+                                "forks": repo.get("forks_count"),
+                                "language": repo.get("language"),
+                                "contributor_logins": contributor_logins,
+                                "source_urls": [repo.get("html_url")],
+                                "data_provenance": "github_public_api",
+                                "fetched_at": fetched_at,
+                            },
+                        )
+                        _add_edge(org_id, repo_id, 2.0, "collaboration")
+
+                        for c in contributors:
+                            if c.get("type") != "User":
+                                continue  # skip bots
+                            dev_id = f"gh-{c['login'].lower()}"
+                            if dev_id not in nodes:
+                                nodes[dev_id] = NetworkNodeIn(
+                                    id=dev_id,
+                                    label=c["login"],
+                                    node_type="developer",
+                                    sub_label=f"{c.get('contributions', 0):,} commits",
+                                    meta={
+                                        "github_login": c["login"],
+                                        "contributions": c.get("contributions"),
+                                        "source_urls": [c.get("html_url")],
+                                        "data_provenance": "github_public_api",
+                                        "fetched_at": fetched_at,
+                                    },
+                                )
+                            # log-scale weight so a 2,000-commit maintainer
+                            # doesn't visually flatten everyone else
+                            w = 1.0 + math.log10(1 + max(0, c.get("contributions", 0)))
+                            _add_edge(dev_id, repo_id, round(w, 3), "contribution")
+        except SeederUnavailable:
+            raise
+        except (httpx.HTTPError, OSError) as exc:
+            raise SeederUnavailable(f"GitHub API unreachable: {exc}") from exc
+
+        if not nodes:
+            raise SeederUnavailable(
+                f"None of the configured seed handles exist on GitHub: {self.handles}"
+            )
+
+        seed_meta = {
+            "seeded_handles": [h for h in self.handles if h not in skipped],
+            "skipped_handles": skipped,
+            "fetched_at": fetched_at,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+        }
+        return list(nodes.values()), edges, seed_meta

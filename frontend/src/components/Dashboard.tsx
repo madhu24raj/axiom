@@ -28,6 +28,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Search, X, Loader2, Sliders, UserPlus } from "lucide-react";
 import { themeCSS } from "../../lib/theme";
 import {
+  getThesis,
   fetchDealPipeline,
   getLiveOpportunities,
   getMode,
@@ -154,6 +155,18 @@ export default function Dashboard() {
   const [showApply, setShowApply] = useState(false);
   const [memoRow, setMemoRow] = useState<DealRow | null>(null);
 
+  const [thesisStrip, setThesisStrip] = useState<string | null>(null);
+  const loadThesisStrip = useCallback(async () => {
+    const r = await getThesis();
+    if (r.data) {
+      const sectors = (r.data.target_sectors ?? []).join(" · ") || "all sectors";
+      setThesisStrip(`${sectors} — ${r.data.stage ?? "any stage"}`);
+    }
+  }, []);
+  useEffect(() => {
+    loadThesisStrip();
+  }, [loadThesisStrip]);
+
   const refreshMode = useCallback(async () => {
     const result = await getMode();
     if (result.data) {
@@ -274,7 +287,7 @@ export default function Dashboard() {
         <div className="flex shrink-0 items-center gap-4">
           <h1 className="font-mono text-sm font-bold tracking-widest text-primary">AXIOM&nbsp;OS</h1>
           <span className="hidden font-mono text-[10px] uppercase tracking-wider text-dim lg:inline">
-            thesis: dev tools · infra · agentic systems — pre-seed
+            thesis: {thesisStrip ?? "loading…"}
           </span>
         </div>
 
@@ -330,7 +343,10 @@ export default function Dashboard() {
       {showThesis && (
         <ThesisConfigPanel
           onClose={() => setShowThesis(false)}
-          onSaved={refreshAll}
+          onSaved={() => {
+            loadThesisStrip();
+            refreshAll();
+          }}
         />
       )}
       {showApply && <ApplyForm onClose={() => setShowApply(false)} onSubmitted={handleApplied} />}

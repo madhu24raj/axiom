@@ -61,6 +61,7 @@ from agents import (
 )
 from network_analysis import (
     SourcingNetworkEngine, NetworkNodeIn, NetworkEdgeIn, SourcingNetworkResult,
+    GitHubGraphSeeder, SeederUnavailable, infer_edges_for_new_node,
 )
 
 logging.basicConfig(
@@ -149,17 +150,25 @@ async def set_thesis(criteria: ThesisCriteriaModel):
 
 # ---------------------------------------------------------------------------
 # Live Session State -- what Live mode's network graph and pipeline overview
-# are actually built from. Deliberately NOT pre-seeded with real people: it
-# starts empty and grows only from searches this session actually runs, so
-# nobody's structural-risk/trust numbers appear on screen without a human
-# having explicitly searched for them. In a multi-user deployment this would
-# be per-session (cookie/user id keyed) rather than process-global.
+# are actually built from. On first Live-mode network fetch it is seeded from
+# the GitHub PUBLIC API (org handles -> top repos -> top contributors --
+# public profiles/commit histories only, every node stamped with its source
+# URL and fetch time), then grows from searches this session runs. Deal rows
+# and scores are still never pre-seeded: seeded nodes are topology, not
+# evaluations. In a multi-user deployment this would be per-session
+# (cookie/user id keyed) rather than process-global.
 # ---------------------------------------------------------------------------
 @dataclass
 class LiveSessionState:
     deal_rows: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     graph_nodes: Dict[str, NetworkNodeIn] = field(default_factory=dict)
     graph_edges: List[NetworkEdgeIn] = field(default_factory=list)
+    # GitHub public-API seeding (Live mode). seed_attempted stops us from
+    # hammering GitHub on every poll if the first attempt failed; hit
+    # POST /api/network/seed to retry explicitly.
+    seed_attempted: bool = False
+    seed_meta: Optional[Dict[str, Any]] = None
+    seed_error: Optional[str] = None
 
 
 live_state = LiveSessionState()
@@ -528,6 +537,48 @@ async def get_live_opportunities():
 _network_engine = SourcingNetworkEngine()
 
 
+async def _ensure_live_seed(force: bool = False) -> None:
+    """Seed Live mode's graph from the GitHub public API exactly once per
+    session (or again on force). Failure is recorded, never masked with
+    fabricated nodes -- the endpoint below falls back to the labeled demo
+    topology instead."""
+    if live_state.seed_attempted and not force:
+        return
+    live_state.seed_attempted = True
+    live_state.seed_error = None
+    try:
+        nodes, edges, meta = await GitHubGraphSeeder().seed()
+    except SeederUnavailable as exc:
+        live_state.seed_error = str(exc)
+        logger.warning("GitHub seed unavailable: %s", exc)
+        return
+    for n in nodes:
+        live_state.graph_nodes.setdefault(n.id, n)
+    seen = {(min(e.source, e.target), max(e.source, e.target)) for e in live_state.graph_edges}
+    for e in edges:
+        k = (min(e.source, e.target), max(e.source, e.target))
+        if k not in seen:
+            seen.add(k)
+            live_state.graph_edges.append(e)
+    live_state.seed_meta = meta
+    logger.info(
+        "GitHub seed complete: %d nodes / %d edges from %s",
+        meta["node_count"], meta["edge_count"], meta["seeded_handles"],
+    )
+
+
+@app.post("/api/network/seed")
+async def reseed_network():
+    """Explicitly (re)run the GitHub public-API seed -- demo insurance if the
+    first lazy attempt hit a rate limit before GITHUB_TOKEN was set."""
+    if mode_state.demo_mode:
+        raise HTTPException(status_code=409, detail="Seeding is a Live-mode operation. Switch to Live mode first.")
+    await _ensure_live_seed(force=True)
+    if live_state.seed_error:
+        raise HTTPException(status_code=503, detail=live_state.seed_error)
+    return {"status": "seeded", **(live_state.seed_meta or {})}
+
+
 @app.get("/api/network/sourcing", response_model=SourcingNetworkResult)
 async def get_sourcing_network():
     if mode_state.demo_mode:
@@ -537,13 +588,36 @@ async def get_sourcing_network():
         result.label = "SIMULATED — demo topology, real graph math"
         return result
 
+    await _ensure_live_seed()
+
     nodes = list(live_state.graph_nodes.values())
     edges = list(live_state.graph_edges)
+
+    if not nodes:
+        # GitHub seed failed AND nothing searched yet. Rather than an empty
+        # screen or a fabricated "live" graph, serve the demo topology with a
+        # label that says exactly what happened and why.
+        raw_nodes = [NetworkNodeIn(**n) for n in mock_data.get_mock_payload("sourcing_network_nodes")]
+        raw_edges = [NetworkEdgeIn(**e) for e in mock_data.get_mock_payload("sourcing_network_edges")]
+        result = _network_engine.run(raw_nodes, raw_edges)
+        result.label = (
+            "LIVE — GitHub seed unavailable "
+            f"({live_state.seed_error or 'unknown'}); showing labeled demo topology"
+        )
+        return result
+
     result = _network_engine.run(nodes, edges)
-    result.label = (
-        f"LIVE — grown from {len(nodes)} real search(es) this session"
-        if nodes else "LIVE — no opportunities searched yet this session"
+    searched = sum(
+        1 for n in nodes if (n.meta or {}).get("data_provenance") != "github_public_api"
     )
+    if live_state.seed_meta:
+        handles = ", ".join(live_state.seed_meta.get("seeded_handles", []))
+        result.label = (
+            f"LIVE — seeded from GitHub public API ({handles}) "
+            f"+ {searched} session search(es)"
+        )
+    else:
+        result.label = f"LIVE — grown from {searched} real search(es) this session"
     return result
 
 
@@ -805,13 +879,39 @@ async def _run_evaluation_and_register(
         row.update(extra_row_fields)
 
     live_state.deal_rows[opportunity_id] = row
-    live_state.graph_nodes[opportunity_id] = NetworkNodeIn(
+
+    # -- Graph registration (node + edges) ---------------------------------
+    # Meta carries the evidence that edge inference keys off: sector, cited
+    # source URLs, and (if disclosed) the github login. All of it comes
+    # straight from the evaluation inputs -- nothing synthesized here.
+    github_url = (extra_row_fields or {}).get("github_url") or ""
+    m = re.match(r"https?://(?:www\.)?github\.com/([^/\s]+)", str(github_url))
+    node_meta: Dict[str, Any] = {
+        "data_provenance": provenance,
+        "data_confidence": data_confidence,
+        "sector": opportunity.get("sector"),
+        "source_urls": (extra_row_fields or {}).get("source_urls", []),
+    }
+    if m:
+        node_meta["github_login"] = m.group(1)
+
+    node = NetworkNodeIn(
         id=opportunity_id,
         label=display_name,
         node_type="developer",
         sub_label=(opportunity.get("keywords") or [None])[0],
-        meta={"data_provenance": provenance, "data_confidence": data_confidence},
+        meta=node_meta,
     )
+    live_state.graph_nodes[opportunity_id] = node
+    new_edges = infer_edges_for_new_node(
+        node, list(live_state.graph_nodes.values()), live_state.graph_edges
+    )
+    live_state.graph_edges.extend(new_edges)
+    if new_edges:
+        logger.info(
+            "Graph: %s linked to %d node(s) via %s",
+            opportunity_id, len(new_edges), sorted({e.edge_type for e in new_edges}),
+        )
     return row
 
 
@@ -895,6 +995,8 @@ async def submit_application(req: ApplicationRequest):
             "deck_text": req.deck_text,
             "stage": req.stage,
             "geography": req.geography,
+            "github_url": req.github_url,
+            "source_urls": [req.github_url] if req.github_url else [],
         },
     )
     return ApplicationResponse(row=row)

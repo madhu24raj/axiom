@@ -127,6 +127,7 @@ async function evaluateProfile(profile: HackathonProfile): Promise<DealRow | nul
       market: DealRow["market"];
       idea_vs_market: DealRow["idea_vs_market"];
       trust_scores: DealRow["trust_scores"];
+      thesis_check: DealRow["thesis_check"];
     };
     momentum: DealRow["momentum"];
   }>("/api/evaluate", {
@@ -145,6 +146,7 @@ async function evaluateProfile(profile: HackathonProfile): Promise<DealRow | nul
     market: evaluation.market,
     idea_vs_market: evaluation.idea_vs_market,
     trust_scores: evaluation.trust_scores,
+    thesis_check: evaluation.thesis_check,
     momentum,
     data_provenance: "demo_fixture",
   };

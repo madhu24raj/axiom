@@ -83,6 +83,10 @@ export interface DealRow {
   market: AxisResult | null;
   idea_vs_market: AxisResult | null;
   trust_scores: TrustScoreResult[];
+  /** The thesis-gate verdict for this deal. detail starts with "REJECT" when
+   *  the deal failed the LP thesis filter (axes are then null BY DESIGN,
+   *  not missing data) -- the table renders these two states differently. */
+  thesis_check?: { step: string; detail: string } | null;
   momentum: MomentumVector;
   data_provenance: DataProvenance;
   data_confidence?: string | null;

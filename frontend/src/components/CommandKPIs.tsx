@@ -12,7 +12,7 @@
 
 import { useMemo } from "react";
 import { Target, TrendingUp, Gauge, Banknote, type LucideIcon } from "lucide-react";
-import type { PipelineOverview } from "../lib/types";
+import type { PipelineOverview } from "../../lib/types";
 import ProvenanceChip from "./ProvenanceChip";
 
 function KPICard({
