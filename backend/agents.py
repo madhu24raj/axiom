@@ -116,11 +116,19 @@ class ThesisCriteria:
     excluded_sectors: List[str] = field(default_factory=list)
     min_founder_score: float = 40.0
     stage: str = "pre-seed"
+    geography: List[str] = field(default_factory=list)   # empty = no geographic restriction
+    ownership_target_pct: float = 10.0
+    risk_appetite: str = "balanced"  # "conservative" | "balanced" | "aggressive"
 
 
 class ThesisEngine:
     """Filters raw opportunities against LP-set thesis criteria before any
-    agent spends compute on deep evaluation."""
+    agent spends compute on deep evaluation. Every field the investor sets
+    (sectors, stage, geography, check size, ownership, risk appetite) is a
+    real input here, not UI-only decoration -- risk_appetite in particular
+    shifts the effective founder-score bar rather than just being displayed."""
+
+    RISK_ADJUSTMENT = {"conservative": 15.0, "balanced": 0.0, "aggressive": -15.0}
 
     def __init__(self, criteria: ThesisCriteria):
         self.criteria = criteria
@@ -128,18 +136,31 @@ class ThesisEngine:
     def passes(self, opportunity: Dict[str, Any]) -> ReasoningStep:
         sector = opportunity.get("sector", "unknown")
         founder_score = opportunity.get("founder_score", 0.0)
+        geography = opportunity.get("geography")
 
         sector_ok = (
             not self.criteria.target_sectors
             or sector in self.criteria.target_sectors
         ) and sector not in self.criteria.excluded_sectors
-        score_ok = founder_score >= self.criteria.min_founder_score
 
-        passed = sector_ok and score_ok
+        effective_min_score = self.criteria.min_founder_score + self.RISK_ADJUSTMENT.get(
+            self.criteria.risk_appetite, 0.0
+        )
+        score_ok = founder_score >= effective_min_score
+
+        geo_ok = (
+            not self.criteria.geography
+            or geography is None  # unknown geography isn't penalized, just not filtered on
+            or geography in self.criteria.geography
+        )
+
+        passed = sector_ok and score_ok and geo_ok
         detail = (
             f"sector='{sector}' (target={self.criteria.target_sectors}, "
             f"excluded={self.criteria.excluded_sectors}) -> {sector_ok}; "
-            f"founder_score={founder_score} >= {self.criteria.min_founder_score} -> {score_ok}"
+            f"founder_score={founder_score} >= {effective_min_score} "
+            f"(base {self.criteria.min_founder_score} + {self.criteria.risk_appetite} adjustment) -> {score_ok}; "
+            f"geography='{geography}' (allowed={self.criteria.geography or 'any'}) -> {geo_ok}"
         )
         logger.info("ThesisEngine.passes(%s) = %s", opportunity.get("id"), passed)
         return ReasoningStep(
@@ -151,12 +172,57 @@ class ThesisEngine:
 # ---------------------------------------------------------------------------
 # 1. Founder Axis Agent
 # ---------------------------------------------------------------------------
+# A founder is treated as "cold start" -- no GitHub, no funding, no network --
+# when they have fewer real signals than this. Below the threshold, the
+# decayed F_S formula alone is unreliable (it's built for weighing MULTIPLE
+# sources against each other), so a separate, explicitly-uncertain assessment
+# runs instead of just reporting a near-zero score with false confidence.
+COLD_START_SIGNAL_THRESHOLD = 2
+
+
 class FounderAxisAgent:
     def __init__(self, tools: AgentTools):
         self.tools = tools
         self.score_engine = FounderScoreEngine()
 
-    async def evaluate(self, profile: FounderProfile) -> AxisResult:
+    async def _assess_cold_start(self, application_text: str) -> Dict[str, Any]:
+        """Grounded ONLY in the applicant's own text -- no GitHub, no network,
+        no funding history to lean on. Returns a POINT estimate plus an
+        explicit [low, high] interval, because a single unverified text
+        sample cannot support the precision a multi-source F_S can."""
+        return await self.tools.llm.structured_complete(
+            system=(
+                "You are assessing a first-time founder with NO GitHub history, no "
+                "funding, and no network signal available -- the cold-start case. Base "
+                "your assessment ONLY on the application text provided below: clarity of "
+                "problem understanding, technical specificity of the proposed approach "
+                "(vs. vague buzzwords), and evidence of domain depth. Because this is a "
+                "single, unverified text sample with no corroborating source, your "
+                "estimate MUST carry a wide confidence interval -- do not report false "
+                "precision."
+            ),
+            prompt=f"Application text:\n{application_text}",
+            schema_hint=(
+                '{"point_estimate_0to100": number, "low_estimate_0to100": number, '
+                '"high_estimate_0to100": number, "rationale": str, '
+                '"primary_signal": "problem_clarity"|"technical_depth"|"specificity"|"mixed"}'
+            ),
+        )
+
+    @staticmethod
+    def _blend_cold_start_history(history: List[Dict[str, Any]]) -> float:
+        """Recency-weighted blend across every cold-start read on file --
+        NOT just the latest one, and NOT a flat average. A single bad/good
+        submission shouldn't fully overwrite prior reads (that's what
+        "never resets" means), but a more recent milestone should still
+        count for more than a stale one (alpha=0.6 on each successive read)."""
+        estimates = [h["point_estimate_0to100"] for h in history]
+        blended = estimates[0]
+        for e in estimates[1:]:
+            blended = 0.6 * e + 0.4 * blended
+        return round(blended, 1)
+
+    async def evaluate(self, profile: FounderProfile, application_text: Optional[str] = None) -> AxisResult:
         trace: List[ReasoningStep] = []
         refs: List[str] = list(profile.public_footprints.values()) if profile.public_footprints else []
 
@@ -169,6 +235,41 @@ class FounderAxisAgent:
                 f"(lambda={breakdown.lambda_decay})"
             ),
         ))
+
+        is_cold_start = len(profile.historical_signals) < COLD_START_SIGNAL_THRESHOLD
+        display_score = f_s
+        confidence = min(1.0, 0.3 + 0.1 * len(profile.historical_signals))
+
+        if is_cold_start and application_text:
+            cold_start_assessment = await self._assess_cold_start(application_text)
+            # Persisted onto the SAME profile object Memory holds -- this is
+            # what makes it accumulate across applications rather than reset.
+            profile.cold_start_history.append({
+                "timestamp": datetime.utcnow().isoformat(),
+                **cold_start_assessment,
+            })
+            blended = self._blend_cold_start_history(profile.cold_start_history)
+            n_reads = len(profile.cold_start_history)
+            trace.append(ReasoningStep(
+                step="cold_start_assessment",
+                detail=(
+                    f"No GitHub/funding/network signal available ({len(profile.historical_signals)} "
+                    f"raw signal(s)) -- this read: {cold_start_assessment.get('point_estimate_0to100')} "
+                    f"[{cold_start_assessment.get('low_estimate_0to100')}, "
+                    f"{cold_start_assessment.get('high_estimate_0to100')}]. Blended across "
+                    f"{n_reads} cold-start read(s) on file -> {blended}. "
+                    f"{cold_start_assessment.get('rationale', '')}"
+                ),
+            ))
+            display_score = blended
+            # Confidence ticks up slightly as more independent reads accumulate,
+            # but stays capped well below a real multi-source F_S's ceiling.
+            confidence = min(0.5, 0.2 + 0.05 * n_reads)
+        elif is_cold_start:
+            trace.append(ReasoningStep(
+                step="cold_start_assessment",
+                detail="No GitHub/funding/network signal AND no application text provided — [Cold-start read: Not Disclosed].",
+            ))
 
         # Skill matrix / grit -- delegated to the LLM for qualitative read,
         # grounded only in the raw signal payloads actually present.
@@ -188,11 +289,17 @@ class FounderAxisAgent:
                 detail="[Skill/Grit: Not Disclosed — no signals available]",
             ))
 
-        confidence = min(1.0, 0.3 + 0.1 * len(profile.historical_signals))
+        metadata: Dict[str, Any] = {
+            "founder_score_breakdown": breakdown.model_dump(),
+            "is_cold_start": is_cold_start,
+        }
+        if profile.cold_start_history:
+            metadata["cold_start_history"] = profile.cold_start_history
+
         return AxisResult(
-            axis="founder", score=f_s, confidence=round(confidence, 2),
+            axis="founder", score=display_score, confidence=round(confidence, 2),
             reasoning_trace=trace, raw_refs=[str(r) for r in refs],
-            metadata={"founder_score_breakdown": breakdown.model_dump()},
+            metadata=metadata,
         )
 
 
@@ -346,6 +453,7 @@ class DealOrchestrator:
         opportunity: Dict[str, Any],
         founder_profile: FounderProfile,
         claims_to_verify: List[Dict[str, Any]],
+        application_text: Optional[str] = None,
     ) -> DealEvaluation:
         thesis_check = self.thesis.passes(opportunity)
         if thesis_check.step == "thesis_filter" and thesis_check.detail.startswith("REJECT"):
@@ -358,7 +466,7 @@ class DealOrchestrator:
 
         # Independent, concurrent, NOT averaged.
         founder_res, market_res, idea_res = await asyncio.gather(
-            self.founder_agent.evaluate(founder_profile),
+            self.founder_agent.evaluate(founder_profile, application_text=application_text),
             self.market_agent.evaluate(
                 opportunity.get("sector", "unknown"), opportunity.get("keywords", [])
             ),

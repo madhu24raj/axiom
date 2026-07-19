@@ -153,6 +153,18 @@ export default function NetworkGraph({
 
   const { stats, structural_risks } = data;
 
+  if (stats.num_nodes === 0) {
+    return (
+      <div className="axiom-fade-in flex h-[220px] flex-col items-center justify-center gap-2 rounded-lg border border-hair bg-panel text-center">
+        <span className="font-mono text-xs uppercase tracking-wider text-muted">{data.label}</span>
+        <p className="max-w-sm font-sans text-xs text-dim">
+          Search for a founder, GitHub handle, or startup above — the graph grows from real
+          diligence activity instead of a canned roster.
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div className="axiom-fade-in grid grid-cols-1 gap-3 lg:grid-cols-[1.6fr_1fr]">
       {/* Graph canvas */}
@@ -168,6 +180,7 @@ export default function NetworkGraph({
             <span>{stats.articulation_point_count} cut-vertices</span>
           </div>
         </div>
+        <p className="mb-2 font-mono text-[10px] text-dim">{data.label}</p>
         <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} className="w-full" role="img" aria-label="Sourcing network graph">
           <g>
             {data.edges.map((e: NetworkEdge, i: number) => {

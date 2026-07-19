@@ -13,6 +13,7 @@
 import { useMemo } from "react";
 import { Target, TrendingUp, Gauge, Banknote, type LucideIcon } from "lucide-react";
 import type { PipelineOverview } from "../lib/types";
+import ProvenanceChip from "./ProvenanceChip";
 
 function KPICard({
   icon: Icon,
@@ -138,7 +139,11 @@ export default function CommandKPIs({
           icon={Banknote}
           label="Capital Deployed"
           value={`$${(kpis.capital_deployed_usd / 1000).toFixed(0)}K`}
-          sublabel={`${kpis.check_size_usd.toLocaleString()} per check`}
+          sublabel={
+            kpis.human_approval_required
+              ? "human sign-off required to deploy"
+              : `${kpis.check_size_usd.toLocaleString()} per check`
+          }
           tone="accent"
         />
 
@@ -160,7 +165,10 @@ export default function CommandKPIs({
           </div>
         </div>
       </div>
-      <span className="font-mono text-[10px] text-dim">{overview.label}</span>
+      <div className="flex items-center gap-2">
+        <ProvenanceChip provenance={overview.provenance} />
+        <span className="font-mono text-[10px] text-dim">{overview.label}</span>
+      </div>
     </div>
   );
 }

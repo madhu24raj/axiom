@@ -8,12 +8,18 @@
  */
 
 import type {
+  ApplicationResponse,
   DealRow,
   FetchResult,
   HackathonProfile,
+  MemoResponsePayload,
   ModeResponse,
+  OpportunitySearchResponse,
+  OutreachDraftResponse,
+  OverseerChatResponse,
   PipelineOverview,
   SourcingNetworkResult,
+  ThesisCriteria,
 } from "./types";
 
 const API_BASE =
@@ -140,6 +146,7 @@ async function evaluateProfile(profile: HackathonProfile): Promise<DealRow | nul
     idea_vs_market: evaluation.idea_vs_market,
     trust_scores: evaluation.trust_scores,
     momentum,
+    data_provenance: "demo_fixture",
   };
 }
 
@@ -154,4 +161,106 @@ export async function fetchDealPipeline(): Promise<FetchResult<DealRow[]>> {
     return { data: null, error: "[Pipeline evaluation unavailable — Not Disclosed]" };
   }
   return { data: clean, error: null };
+}
+
+/**
+ * Live mode's pipeline: exactly what's been searched + evaluated this
+ * session (backend/main.py's LiveSessionState). Empty on a fresh session --
+ * that's the honest state, not an error.
+ */
+export async function getLiveOpportunities(): Promise<FetchResult<DealRow[]>> {
+  return safeFetch<DealRow[]>("/api/opportunities/live");
+}
+
+/**
+ * Keyword-heuristic filter over the active roster. In Live mode, a query
+ * that matches nothing triggers a real Tavily+LLM enrichment pass on the
+ * backend for that specific target -- see main.py's search_opportunities.
+ */
+export async function searchOpportunities(
+  query: string
+): Promise<FetchResult<OpportunitySearchResponse>> {
+  return safeFetch<OpportunitySearchResponse>("/api/opportunities/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query }),
+  });
+}
+
+/**
+ * Ask the Overseer about one specific deal's already-computed numbers.
+ * `context` should be the DealRow (plus an optional `network_risk` entry
+ * merged in by the caller) -- the backend only ever reasons over exactly
+ * what's passed here.
+ */
+export async function postOverseerChat(
+  context: Record<string, any>,
+  thesis: Record<string, any>,
+  message: string
+): Promise<FetchResult<OverseerChatResponse>> {
+  return safeFetch<OverseerChatResponse>("/api/overseer/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ context, thesis, message }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Thesis Engine -- required MVP #1: investor-configurable sectors, stage,
+// geography, check size, ownership targets, and risk appetite.
+// ---------------------------------------------------------------------------
+export async function getThesis(): Promise<FetchResult<ThesisCriteria>> {
+  return safeFetch<ThesisCriteria>("/api/thesis");
+}
+
+export async function setThesis(criteria: ThesisCriteria): Promise<FetchResult<ThesisCriteria>> {
+  return safeFetch<ThesisCriteria>("/api/thesis", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(criteria),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Inbound Application -- required MVP #4: deck + company name minimum bar.
+// Works in both Demo and Live mode (self-disclosed applicant data).
+// ---------------------------------------------------------------------------
+export async function submitApplication(payload: {
+  company_name: string;
+  deck_text: string;
+  founder_name: string;
+  sector?: string;
+  stage?: string;
+  geography?: string;
+  github_url?: string;
+}): Promise<FetchResult<ApplicationResponse>> {
+  return safeFetch<ApplicationResponse>("/api/apply", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Investment Memo -- Appendix 1's structure, grounded in the row's own
+// already-computed data; missing sections come back as "Not disclosed."
+// ---------------------------------------------------------------------------
+export async function generateMemo(row: DealRow): Promise<FetchResult<MemoResponsePayload>> {
+  return safeFetch<MemoResponsePayload>("/api/memo/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ row }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Outbound Activate (MVP #5) -- outreach DRAFT for human review, never
+// auto-sent by the system.
+// ---------------------------------------------------------------------------
+export async function draftOutreach(row: DealRow): Promise<FetchResult<OutreachDraftResponse>> {
+  return safeFetch<OutreachDraftResponse>("/api/outreach/draft", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ row }),
+  });
 }

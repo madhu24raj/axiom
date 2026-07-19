@@ -169,6 +169,21 @@ class SourcingNetworkEngine:
     def run(
         self, nodes: List[NetworkNodeIn], edges: List[NetworkEdgeIn]
     ) -> SourcingNetworkResult:
+        if not nodes:
+            # The null graph has no meaningful centrality/fragmentation math --
+            # return a valid, honestly-empty result rather than raising or
+            # (worse) fabricating placeholder nodes to avoid an empty screen.
+            return SourcingNetworkResult(
+                nodes=[],
+                edges=[],
+                structural_risks=[],
+                stats=NetworkStats(
+                    num_nodes=0, num_edges=0, density=0.0,
+                    num_connected_components=0, largest_component_size=0,
+                    avg_clustering_coefficient=0.0, articulation_point_count=0,
+                ),
+            )
+
         graph = nx.Graph()
         for n in nodes:
             graph.add_node(n.id, **n.model_dump())
@@ -254,7 +269,9 @@ class SourcingNetworkEngine:
             density=round(nx.density(graph), 4),
             num_connected_components=len(components),
             largest_component_size=max((len(c) for c in components), default=0),
-            avg_clustering_coefficient=round(nx.average_clustering(graph), 4),
+            avg_clustering_coefficient=(
+                round(nx.average_clustering(graph), 4) if graph.number_of_nodes() > 0 else 0.0
+            ),
             articulation_point_count=len(articulation_points),
         )
 

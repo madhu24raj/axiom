@@ -55,13 +55,33 @@ class FounderProfile(BaseModel):
     historical_signals: List[SignalMetric] = Field(default_factory=list)
     current_founder_score: float = 0.0
     score_history: List[Dict[str, Any]] = Field(default_factory=list)
+    # Persistent log of cold-start (no-GitHub/no-funding/no-network) reads --
+    # kept separate from historical_signals because it's a different kind of
+    # evidence (a single unverified text sample) and blended, not formula-
+    # weighted, across applications. See FounderAxisAgent._blend_cold_start.
+    cold_start_history: List[Dict[str, Any]] = Field(default_factory=list)
     last_updated: datetime = Field(default_factory=datetime.utcnow)
 
 
 class MomentumDirection(str, Enum):
     UP = "up"
-    FLAT = "flat"
     DOWN = "down"
+    PIVOT = "pivot"     # a genuine trend reversal, not just noise
+    FLAT = "flat"
+
+
+# ---------------------------------------------------------------------------
+# Momentum Vector -- direction + the actual velocity/acceleration numbers
+# behind it, so the UI never has to take "up" or "down" on faith.
+# ---------------------------------------------------------------------------
+class MomentumVector(BaseModel):
+    direction: MomentumDirection
+    arrow: str
+    velocity: float           # signed rate of change over the most recent window
+    prior_velocity: Optional[float] = None
+    accelerating: bool = False
+    basis: str                # "score_history" | "signal_frequency" | "insufficient_data"
+    note: str
 
 
 # ---------------------------------------------------------------------------
@@ -303,17 +323,144 @@ class TrustScoreEngine:
 # 3. Momentum Tracker -- converts score_history into a UI-ready direction
 # ---------------------------------------------------------------------------
 class MomentumTracker:
-    @staticmethod
-    def direction(score_history: List[Dict[str, Any]], flat_epsilon: float = 1.5) -> MomentumDirection:
-        if len(score_history) < 2:
-            return MomentumDirection.FLAT
-        delta = score_history[-1]["score"] - score_history[-2]["score"]
-        if delta > flat_epsilon:
+    """Classifies momentum from real deltas -- never a hardcoded fallback
+    string. Two data sources, tried in order:
+
+    1. score_history  -- if the profile has been scored 2+ times, compare
+       consecutive deltas. A same-signed delta that's growing/shrinking is
+       UP/DOWN; a delta that *reverses sign* against the prior delta (beyond
+       noise) is classified PIVOT -- the founder's trajectory genuinely
+       changed direction, which is a distinct, higher-attention signal than
+       "just slightly down."
+    2. signal_frequency -- for a profile with no score_history yet (e.g. a
+       founder ingested moments ago via the live search bar), bucket its
+       raw signals into three trailing 7-day windows by timestamp and run
+       the identical reversal logic over bucket intensity instead of score.
+       This is what lets momentum mean something on the very first
+       evaluation of a live-enriched founder, instead of silently
+       defaulting to FLAT.
+    """
+
+    ARROWS = {
+        MomentumDirection.UP: "\u2197",      # ↗
+        MomentumDirection.DOWN: "\u2198",    # ↘
+        MomentumDirection.PIVOT: "\u21CC",   # ⇌
+        MomentumDirection.FLAT: "\u2192",    # →
+    }
+
+    @classmethod
+    def arrow(cls, direction: MomentumDirection) -> str:
+        return cls.ARROWS[direction]
+
+    @classmethod
+    def _classify_deltas(
+        cls, latest_delta: float, prior_delta: Optional[float], flat_epsilon: float
+    ) -> MomentumDirection:
+        if prior_delta is not None:
+            reversed_up_to_down = prior_delta > flat_epsilon and latest_delta < -flat_epsilon
+            reversed_down_to_up = prior_delta < -flat_epsilon and latest_delta > flat_epsilon
+            if reversed_up_to_down or reversed_down_to_up:
+                return MomentumDirection.PIVOT
+        if latest_delta > flat_epsilon:
             return MomentumDirection.UP
-        if delta < -flat_epsilon:
+        if latest_delta < -flat_epsilon:
             return MomentumDirection.DOWN
         return MomentumDirection.FLAT
 
-    @staticmethod
-    def arrow(direction: MomentumDirection) -> str:
-        return {"up": "\u2197", "flat": "\u2192", "down": "\u2198"}[direction.value]
+    @classmethod
+    def from_score_history(
+        cls, score_history: List[Dict[str, Any]], flat_epsilon: float = 1.5
+    ) -> MomentumVector:
+        if len(score_history) < 2:
+            return MomentumVector(
+                direction=MomentumDirection.FLAT, arrow=cls.arrow(MomentumDirection.FLAT),
+                velocity=0.0, basis="insufficient_data",
+                note="Fewer than 2 score_history points — no trend to measure yet.",
+            )
+
+        deltas = [
+            score_history[i]["score"] - score_history[i - 1]["score"]
+            for i in range(1, len(score_history))
+        ]
+        latest_delta = deltas[-1]
+        prior_delta = deltas[-2] if len(deltas) >= 2 else None
+        direction = cls._classify_deltas(latest_delta, prior_delta, flat_epsilon)
+        accelerating = prior_delta is not None and abs(latest_delta) > abs(prior_delta)
+
+        note = f"Δscore latest={latest_delta:+.2f}"
+        if prior_delta is not None:
+            note += f", prior={prior_delta:+.2f}"
+        if direction == MomentumDirection.PIVOT:
+            note += " — trend reversed direction, not just decelerating."
+
+        return MomentumVector(
+            direction=direction, arrow=cls.arrow(direction),
+            velocity=round(latest_delta, 2),
+            prior_velocity=round(prior_delta, 2) if prior_delta is not None else None,
+            accelerating=accelerating, basis="score_history", note=note,
+        )
+
+    @classmethod
+    def from_signals(
+        cls, signals: List[SignalMetric], window_days: int = 7, flat_epsilon: float = 0.08
+    ) -> MomentumVector:
+        """Fallback for founders with no score_history yet: bucket raw
+        signals by age into three trailing windows and treat mean
+        normalized_score per bucket as an intensity proxy, then run the
+        same reversal-aware classifier over bucket-to-bucket deltas."""
+        if not signals:
+            return MomentumVector(
+                direction=MomentumDirection.FLAT, arrow=cls.arrow(MomentumDirection.FLAT),
+                velocity=0.0, basis="insufficient_data",
+                note="No signals available to derive a momentum trend.",
+            )
+
+        now = datetime.utcnow()
+        buckets = [[], [], []]  # [0-7d], [7-14d], [14-21d]
+        for sig in signals:
+            age = FounderScoreEngine._age_days(sig.timestamp, now)
+            idx = age // window_days
+            if idx <= 2:
+                buckets[int(idx)].append(sig.normalized_score)
+
+        def bucket_mean(vals: List[float]) -> Optional[float]:
+            return round(sum(vals) / len(vals), 4) if vals else None
+
+        recent, mid, old = (bucket_mean(b) for b in buckets)
+
+        if recent is None or mid is None:
+            return MomentumVector(
+                direction=MomentumDirection.FLAT, arrow=cls.arrow(MomentumDirection.FLAT),
+                velocity=0.0, basis="signal_frequency",
+                note="Not enough signal history across trailing windows to derive a trend yet.",
+            )
+
+        latest_delta = recent - mid
+        prior_delta = (mid - old) if old is not None else None
+        # Signal-intensity deltas live on a 0-1 scale; scale threshold accordingly.
+        direction = cls._classify_deltas(latest_delta, prior_delta, flat_epsilon)
+        accelerating = prior_delta is not None and abs(latest_delta) > abs(prior_delta)
+
+        note = f"Signal intensity Δ(0-7d vs 7-14d)={latest_delta:+.3f}"
+        if prior_delta is not None:
+            note += f", Δ(7-14d vs 14-21d)={prior_delta:+.3f}"
+        if direction == MomentumDirection.PIVOT:
+            note += " — activity direction reversed across trailing windows."
+
+        return MomentumVector(
+            direction=direction, arrow=cls.arrow(direction),
+            velocity=round(latest_delta * 100, 2),  # rescaled to score-like units
+            prior_velocity=round(prior_delta * 100, 2) if prior_delta is not None else None,
+            accelerating=accelerating, basis="signal_frequency", note=note,
+        )
+
+    @classmethod
+    def for_profile(cls, profile: FounderProfile) -> MomentumVector:
+        if len(profile.score_history) >= 2:
+            return cls.from_score_history(profile.score_history)
+        return cls.from_signals(profile.historical_signals)
+
+    # --- Backward-compatible shim for callers still using the old API ---
+    @classmethod
+    def direction(cls, score_history: List[Dict[str, Any]], flat_epsilon: float = 1.5) -> MomentumDirection:
+        return cls.from_score_history(score_history, flat_epsilon).direction

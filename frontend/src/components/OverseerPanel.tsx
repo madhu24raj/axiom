@@ -4,16 +4,22 @@
  * OverseerPanel.tsx
  * -----------------
  * "The Overseer" -- the human partner's terminal into the agent mesh's exact
- * chain of thought. Two halves:
- *   1. A Recharts RadarChart plotting the 3 independent axes + a momentum
- *      readout (never averaged into one number -- see agents.py docstring).
- *   2. A terminal-log style trace: the decayed Founder Score (F_S) built up
- *      signal-by-signal, the Market/Idea-vs-Market reasoning steps, and the
- *      Bayesian Trust Score validation for every claim that was checked --
- *      including the actual cached/live evidence excerpt, not a summary of
- *      one.
+ * chain of thought, now with a live Q&A channel. Three sections:
+ *   1. A Recharts RadarChart plotting the 3 independent axes + a real
+ *      momentum vector (direction, velocity, acceleration -- see
+ *      scoring.py's MomentumTracker; never a hardcoded arrow).
+ *   2. A terminal-log trace: the decayed Founder Score (F_S) built up
+ *      signal-by-signal, Market/Idea-vs-Market reasoning steps, and the
+ *      Bayesian Trust Score validation with real evidence excerpts.
+ *   3. An Overseer chat: ask about this ONE deal's numbers. In Demo mode
+ *      this is answered by a deterministic, fully-offline explainer that
+ *      reads the real numbers straight out of the context below (see
+ *      main.py's _deterministic_overseer_reply); in Live mode it's a real
+ *      Anthropic API call, still constrained by a system prompt that
+ *      forbids introducing new unverified facts about the individual.
  */
 
+import { useState } from "react";
 import {
   PolarAngleAxis,
   PolarGrid,
@@ -22,11 +28,37 @@ import {
   RadarChart,
   ResponsiveContainer,
 } from "recharts";
-import { X, Sigma, FlaskConical } from "lucide-react";
-import type { DealRow, FounderScoreBreakdown, ReasoningStep } from "../lib/types";
+import { X, Sigma, FlaskConical, Send, ShieldAlert, Bot, Sparkles, Mail } from "lucide-react";
+import type {
+  ColdStartRead,
+  DealRow,
+  FounderScoreBreakdown,
+  OverseerChatTurn,
+  ReasoningStep,
+  StructuralRisk,
+} from "../../lib/types";
+import { draftOutreach, postOverseerChat } from "../../lib/api";
 
 function fmtScore(score: number | null): string {
   return score === null ? "—" : score.toFixed(1);
+}
+
+function MomentumReadout({ row }: { row: DealRow }) {
+  const m = row.momentum;
+  const tone =
+    m.direction === "up" ? "text-bull" : m.direction === "down" ? "text-bear" : m.direction === "pivot" ? "text-accent" : "text-neutral";
+  return (
+    <div className="flex flex-col items-end gap-0.5">
+      <span className={`font-mono text-sm ${tone}`}>
+        Momentum {m.arrow} {m.direction}
+        {m.accelerating && <span className="ml-1 text-[10px] opacity-80">(accelerating)</span>}
+      </span>
+      <span className="font-mono text-[9px] text-dim">
+        v={m.velocity.toFixed(2)}
+        {m.prior_velocity !== null && `, prior=${m.prior_velocity.toFixed(2)}`} · {m.basis}
+      </span>
+    </div>
+  );
 }
 
 function RadarSection({ row }: { row: DealRow }) {
@@ -42,20 +74,11 @@ function RadarSection({ row }: { row: DealRow }) {
     return { axis: label, score: axis?.score ?? 0 };
   });
 
-  const momentumTone =
-    row.momentum.direction === "up"
-      ? "text-bull"
-      : row.momentum.direction === "down"
-      ? "text-bear"
-      : "text-neutral";
-
   return (
     <div className="border-b border-hair px-5 py-4">
-      <div className="flex items-center justify-between">
+      <div className="flex items-start justify-between gap-3">
         <h4 className="font-mono text-xs uppercase tracking-wider text-muted">3-Axis Radar</h4>
-        <span className={`font-mono text-sm ${momentumTone}`}>
-          Momentum {row.momentum.arrow} {row.momentum.direction}
-        </span>
+        <MomentumReadout row={row} />
       </div>
       <ResponsiveContainer width="100%" height={200}>
         <RadarChart data={radarData} outerRadius="72%">
@@ -86,6 +109,7 @@ function RadarSection({ row }: { row: DealRow }) {
           Plotted at 0 for chart continuity, not asserted as zero — Not Disclosed: {notDisclosed.join(", ")}
         </p>
       )}
+      <p className="mt-1 font-mono text-[10px] text-dim">{row.momentum.note}</p>
     </div>
   );
 }
@@ -157,10 +181,94 @@ function TraceLog({ label, trace }: { label: string; trace: ReasoningStep[] }) {
   );
 }
 
+function ColdStartSection({ row }: { row: DealRow }) {
+  const meta = row.founder?.metadata;
+  const history = meta?.cold_start_history as ColdStartRead[] | undefined;
+  if (!meta?.is_cold_start || !history || history.length === 0) return null;
+  return (
+    <div className="mb-6">
+      <div className="mb-2 flex items-center gap-2">
+        <Sparkles size={13} className="text-accent" />
+        <h4 className="font-mono text-xs uppercase tracking-wider text-muted">Cold-Start Assessment</h4>
+      </div>
+      <p className="mb-2 font-sans text-[11px] leading-relaxed text-muted">
+        No GitHub / funding / network signal on file — the displayed Founder score is a recency-weighted
+        blend of the application-text read(s) below, NOT the decayed multi-source formula. Each read
+        carries an explicit range instead of false precision.
+      </p>
+      <ul className="space-y-2">
+        {history.map((h, i) => (
+          <li key={i} className="rounded border border-hair bg-panel-raised px-3 py-2">
+            <div className="flex items-center justify-between font-mono text-[10px]">
+              <span className="text-primary">
+                read #{i + 1}: {h.point_estimate_0to100.toFixed(1)}
+                <span className="ml-1 text-dim">
+                  [{h.low_estimate_0to100.toFixed(0)}, {h.high_estimate_0to100.toFixed(0)}]
+                </span>
+              </span>
+              <span className="text-dim">{h.primary_signal}</span>
+            </div>
+            <p className="mt-1 font-sans text-[10px] leading-relaxed text-dim">
+              {h.rationale.replace(/^\[DEMO heuristic\]\s*/, "")}
+            </p>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function OutreachSection({ row }: { row: DealRow }) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleDraft() {
+    setLoading(true);
+    setError(null);
+    const res = await draftOutreach(row);
+    setLoading(false);
+    if (res.data) {
+      setDraft(res.data.draft);
+      setNote(res.data.note);
+    } else {
+      setError(res.error);
+    }
+  }
+
+  return (
+    <div className="mb-6">
+      <div className="mb-2 flex items-center gap-2">
+        <Mail size={13} className="text-axis-idea" />
+        <h4 className="font-mono text-xs uppercase tracking-wider text-muted">Activate — Outreach</h4>
+      </div>
+      {!draft && (
+        <button
+          onClick={handleDraft}
+          disabled={loading}
+          className="rounded border border-hair px-3 py-1.5 font-mono text-[11px] text-muted hover:border-accent/50 hover:text-primary disabled:opacity-50"
+        >
+          {loading ? "Drafting…" : "Draft outreach from computed signals"}
+        </button>
+      )}
+      {error && <p className="font-mono text-[10px] text-bear">{error}</p>}
+      {draft && (
+        <div className="rounded border border-hair bg-panel-raised px-3 py-2.5">
+          <pre className="whitespace-pre-wrap font-sans text-xs leading-relaxed text-primary">
+            {draft.replace(/^\[DEMO DRAFT — for human review before sending\]\s*/, "")}
+          </pre>
+          {note && <p className="mt-2 border-t border-hair pt-2 font-mono text-[9px] text-dim">{note}</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TrustSection({ row }: { row: DealRow }) {
   if (row.trust_scores.length === 0) return null;
   return (
-    <div>
+    <div className="mb-6">
       <div className="mb-2 flex items-center gap-2">
         <FlaskConical size={13} className="text-axis-market" />
         <h4 className="font-mono text-xs uppercase tracking-wider text-muted">Bayesian Trust-Score Validation</h4>
@@ -198,7 +306,107 @@ function TrustSection({ row }: { row: DealRow }) {
   );
 }
 
-export default function OverseerPanel({ row, onClose }: { row: DealRow | null; onClose: () => void }) {
+function OverseerChat({ row, networkRisk }: { row: DealRow; networkRisk: StructuralRisk | null }) {
+  const [turns, setTurns] = useState<OverseerChatTurn[]>([]);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const suggestions = ["Why did the trust score decay?", "How fragile is this node in the network?", "Break down F_S"];
+
+  async function send(message: string) {
+    if (!message.trim() || sending) return;
+    setSending(true);
+    setError(null);
+    setTurns((t) => [...t, { role: "user", text: message }]);
+    setInput("");
+
+    const context = { ...row, network_risk: networkRisk };
+    const result = await postOverseerChat(context, {}, message);
+    if (result.data) {
+      setTurns((t) => [...t, { role: "assistant", text: result.data!.reply }]);
+    } else {
+      setError(result.error);
+    }
+    setSending(false);
+  }
+
+  return (
+    <div className="flex flex-col border-t border-hair">
+      <div className="flex items-center gap-2 px-5 py-3">
+        <Bot size={13} className="text-accent" />
+        <h4 className="font-mono text-xs uppercase tracking-wider text-muted">Ask the Overseer</h4>
+      </div>
+
+      {turns.length === 0 && (
+        <div className="flex flex-wrap gap-1.5 px-5 pb-3">
+          {suggestions.map((s) => (
+            <button
+              key={s}
+              onClick={() => send(s)}
+              className="rounded border border-hair px-2 py-1 font-mono text-[10px] text-muted hover:border-accent/50 hover:text-primary"
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {turns.length > 0 && (
+        <div className="axiom-scrollbar max-h-52 overflow-y-auto px-5 pb-3">
+          <ul className="flex flex-col gap-2.5">
+            {turns.map((t, i) => (
+              <li key={i} className={t.role === "user" ? "text-right" : "text-left"}>
+                <span
+                  className={`inline-block max-w-[90%] rounded px-2.5 py-1.5 text-left font-mono text-[11px] leading-relaxed ${
+                    t.role === "user" ? "bg-panel-raised text-primary" : "bg-panel-inset text-muted"
+                  }`}
+                >
+                  {t.text}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {error && <p className="px-5 pb-2 font-mono text-[10px] text-bear">{error}</p>}
+
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          send(input);
+        }}
+        className="flex items-center gap-2 border-t border-hair px-4 py-2.5"
+      >
+        <span className="font-mono text-xs text-accent">&gt;</span>
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Ask about this deal's numbers…"
+          className="flex-1 bg-transparent font-mono text-xs text-primary placeholder:text-dim focus:outline-none"
+        />
+        <button
+          type="submit"
+          disabled={sending || !input.trim()}
+          className="rounded border border-hair p-1.5 text-muted hover:border-accent/50 hover:text-primary disabled:opacity-40"
+        >
+          <Send size={12} />
+        </button>
+      </form>
+    </div>
+  );
+}
+
+export default function OverseerPanel({
+  row,
+  networkRisk,
+  onClose,
+}: {
+  row: DealRow | null;
+  networkRisk: StructuralRisk | null;
+  onClose: () => void;
+}) {
   if (!row) return null;
   const founderBreakdown = row.founder?.metadata?.founder_score_breakdown as FounderScoreBreakdown | undefined;
 
@@ -225,10 +433,23 @@ export default function OverseerPanel({ row, onClose }: { row: DealRow | null; o
 
       <div className="axiom-scrollbar flex-1 overflow-y-auto px-5 py-4">
         <FounderMathSection breakdown={founderBreakdown} />
+        <ColdStartSection row={row} />
         <TraceLog label="Market Axis — Reasoning Trace" trace={row.market?.reasoning_trace ?? []} />
         <TraceLog label="Idea vs. Market Axis — Reasoning Trace" trace={row.idea_vs_market?.reasoning_trace ?? []} />
         <TrustSection row={row} />
+        <OutreachSection row={row} />
+        {networkRisk && (
+          <div>
+            <div className="mb-2 flex items-center gap-2">
+              <ShieldAlert size={13} className="text-risk-critical" />
+              <h4 className="font-mono text-xs uppercase tracking-wider text-muted">Network Structural Risk</h4>
+            </div>
+            <p className="font-sans text-xs leading-relaxed text-muted">{networkRisk.narrative}</p>
+          </div>
+        )}
       </div>
+
+      <OverseerChat row={row} networkRisk={networkRisk} />
     </div>
   );
 }
